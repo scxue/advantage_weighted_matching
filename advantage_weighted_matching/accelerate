@@ -1,0 +1,17 @@
+#!/home/colligo/miniconda3/envs/flow_grpo/bin/python
+# -*- coding: utf-8 -*-
+import re
+import sys
+from accelerate.commands.accelerate_cli import main
+import os
+if __name__ == '__main__':
+    if os.environ.get('DEBUG', None) is not None:
+        print(f"DEBUG MODE: {os.environ.get('DEBUG')}")
+        import debugpy
+        debugpy.listen(9502)
+        debugpy.wait_for_client()
+        print("Waiting for debugger to attach...")
+
+
+    sys.argv[0] = re.sub(r'(-script\.pyw|\.exe)?$', '', sys.argv[0])
+    sys.exit(main())

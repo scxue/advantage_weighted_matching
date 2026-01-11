@@ -1,0 +1,21 @@
+// @hoshyari: In future we should merge this with colligo. For now to get things going.
+{
+    "python.defaultInterpreterPath": "/opt/venv/bin/python",
+    "python.analysis.autoImportCompletions": true,
+    "files.exclude": {
+        "**/.git": true,
+        "**/.svn": true,
+        "**/.hg": true,
+        "**/CVS": true,
+        "**/.DS_Store": true,
+        "**/Thumbs.db": true,
+        "**/__pycache__" : true,
+        "**/node_modules/" : true,
+        "**/.mypy_cache" : true,
+        "**/.metals" : true,
+        "**/.pytest_cache" : true,
+        "**/.ruff_cache" : true,
+        ".venv" : true,
+        "**/*.egg-info" : true,
+    },
+}
