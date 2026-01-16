@@ -24,7 +24,7 @@ setup(
         "pillow==10.4.0",
         
         "tqdm==4.67.1",
-        "byted-wandb",
+        "wandb",
         "pydantic==2.10.6",  
         "requests==2.32.3",
         "matplotlib==3.10.0",
