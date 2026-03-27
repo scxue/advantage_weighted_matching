@@ -52,7 +52,7 @@ def geneval_sd3_no_cfg_1node():
     config.train.gradient_accumulation_steps = config.sample.train_batch_size // config.train.batch_size * config.sample.num_batches_per_epoch
     config.train.num_batches_per_epoch = config.sample.train_batch_size // config.train.batch_size * config.sample.num_batches_per_epoch
     config.train.num_inner_epochs = 1
-    config.train.beta = 0.003
+    config.train.beta = 0.001
     config.train.train_timesteps = 6
     config.train.kl_weight = 'Uniform'
     config.train.advantage_max = 1
@@ -121,7 +121,7 @@ def geneval_sd3_no_cfg_4nodes():
     config.train.gradient_accumulation_steps = config.sample.train_batch_size // config.train.batch_size * config.sample.num_batches_per_epoch
     config.train.num_batches_per_epoch = config.sample.train_batch_size // config.train.batch_size * config.sample.num_batches_per_epoch
     config.train.num_inner_epochs = 1
-    config.train.beta = 0.003
+    config.train.beta = 0.001
     config.train.train_timesteps = 6
     config.train.kl_weight = 'Uniform'
     config.train.advantage_max = 1
