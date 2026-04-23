@@ -148,6 +148,22 @@ config.eval_freq = 20–50                                              # Evalua
 
 ### Hyperparameter Guidelines
 
+**CFG Scale during Rollout and Evaluation; KL Reference Model**
+
+In our early experiment, we used a guidance scale of $\text{cfg}=4.5$ for both rollout and evaluation and set the reference model to the base model. 
+
+In later experiments, we observe that a guidance scale of $\text{cfg}=1.0$ for both rollout and evaluation also works (similar to DanceGRPO, FlowGRPO-fast and DiffusionNFT), which saves about half the computation during rollout. We also observe that setting a large coefficient for KL with respect to the EMA model (using a linear warmup EMA rate min(0.001* iter, 0.3)), and a small coefficient for KL with respect to the base model will be better.
+
+Some of my personal views on CFG:
+
+(1) From the theoretical perspective of the consistency between rollout policy and train policy, as CFG should not be used in diffusion/flow loss, the rollout policy should be $\text{cfg}=1.0$. However, in practice, RL using rollout $\text{cfg}=2.0,3.0,4.0$ also works.
+
+(2) Rollout with $\text{cfg}=1.0$ enables the model to quickly gain the ability to generate without cfg in 10 steps. I attribute this fact to both RL and CFG sharpening the distribution.
+
+(3) My experience: the evaluation cfg should be set equal to or slightly larger than the cfg during rollout. For example, when training the model with rollout $\text{cfg}=1.0$, using a cfg scale of 1.5 for inference will generally be visually better, at roughly twice the computational cost.
+
+(4) There is one thing I have not done a systematic ablation on: as the base model does not have the ability to generate without cfg, the KL term with respect to the base model might not be perfect. My current solution is using a large coefficient for KL with respect to the EMA model, and a small coefficient for KL with respect to the base model, as the EMA model quickly follows the running model to learn the ability to generate without cfg. Using a $\text{cfg}=2.0$ base model in KL divergence might be better.
+
 **Training Batch Relationship**:
 ```python
 config.train.gradient_accumulation_steps = config.sample.train_batch_size // config.train.batch_size * config.sample.num_batches_per_epoch                                                 # Set to maintain on policy
