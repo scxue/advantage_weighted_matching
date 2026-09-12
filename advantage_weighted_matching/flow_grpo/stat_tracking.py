@@ -1,4 +1,5 @@
 import numpy as np
+import hashlib
 from collections import deque
 
 
@@ -19,7 +20,7 @@ class PerPromptStatTracker:
             if prompt not in self.stats:
                 self.stats[prompt] = []
             self.stats[prompt].extend(prompt_rewards)
-            self.history_prompts.add(hash(prompt))  # Add hash of prompt to history_prompts
+            self.history_prompts.add(hashlib.sha256(str(prompt).encode("utf-8")).hexdigest())
         for prompt in unique:
             self.stats[prompt] = np.stack(self.stats[prompt])
             prompt_rewards = rewards[prompts == prompt]  # Fix: Recalculate prompt_rewards for each prompt

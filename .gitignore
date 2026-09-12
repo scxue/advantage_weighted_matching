@@ -1,1 +1,22 @@
 logs/
+
+# Training, reward-server and Slurm logs (including rotated logs).
+*.log
+*.log.*
+*.out
+*.err
+events.out.tfevents.*
+
+# W&B run history, generated media and local caches.
+wandb/
+*.wandb
+
+# Local experiment outputs, logs, checkpoints and frozen run snapshots.
+/debug_outputs/
+/outputs/
+/.cache/
+/third_party/mmcv/
+/third_party/mmdetection/
+
+# Downloaded Geneval object-detector weights.
+/reward-server/mask2former_swin-s-p4-w7-224_lsj_8x2_50e_coco.pth

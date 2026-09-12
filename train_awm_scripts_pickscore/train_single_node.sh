@@ -10,7 +10,7 @@ source "$(dirname "$0")/../setup/common_vars.sh"
 # --- MINIMAL MODIFICATION START: Log into services ---
 # Activate a base environment to use the login CLIs.
 source_conda
-conda activate awm
+conda activate "$AWM_ENV_NAME"
 if [ -n "$HUGGINGFACE_TOKEN" ]; then
     huggingface-cli login --token "$HUGGINGFACE_TOKEN"
 fi
@@ -84,7 +84,7 @@ log "Output will be logged to: ${TRAINING_LOG}"
 (
   set -e
   source_conda
-  conda activate awm
+  conda activate "$AWM_ENV_NAME"
   # Assuming the paths in the command are relative to the project root
   cd "${PROJECT_ROOT}/advantage_weighted_matching"
   accelerate launch \

@@ -10,7 +10,7 @@ source "$(dirname "$0")/../setup/common_vars.sh"
 # --- MINIMAL MODIFICATION START: Log into services ---
 # Activate a base environment to use the login CLIs.
 source_conda
-conda activate awm
+conda activate "$AWM_ENV_NAME"
 if [ -n "$HUGGINGFACE_TOKEN" ]; then
     huggingface-cli login --token "$HUGGINGFACE_TOKEN"
 fi
@@ -65,7 +65,7 @@ log "Output will be logged to: ${REWARD_SERVER_LOG}"
 (
   set -e
   source_conda
-  conda activate reward_server
+  conda activate "$AWM_REWARD_ENV_NAME"
   cd "${PROJECT_ROOT}/reward-server/"
   # Use setsid to ensure we can kill the whole process group
   setsid gunicorn "app_geneval:create_app()"
@@ -84,7 +84,7 @@ log "Output will be logged to: ${TRAINING_LOG}"
 (
   set -e
   source_conda
-  conda activate awm
+  conda activate "$AWM_ENV_NAME"
   # Assuming the paths in the command are relative to the project root
   cd "${PROJECT_ROOT}/advantage_weighted_matching"
   accelerate launch \

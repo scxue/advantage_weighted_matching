@@ -64,7 +64,7 @@ class EMAModuleWrapper:
 
     def copy_ema_to(self, parameters: Iterable[torch.nn.Parameter], store_temp: bool = True) -> None:
         if store_temp:
-            self.temp_stored_parameters = [parameter.detach().cpu() for parameter in parameters]
+            self.temp_stored_parameters = [parameter.detach().cpu().clone() for parameter in parameters]
 
         parameters = list(parameters)
         for ema_parameter, parameter in zip(self.ema_parameters, parameters, strict=True):
@@ -77,12 +77,18 @@ class EMAModuleWrapper:
         self.temp_stored_parameters = None
 
     def load_state_dict(self, state_dict: dict) -> None:
-        self.decay = self.decay if self.decay else state_dict.get("decay", self.decay)
-        self.ema_parameters = state_dict.get("ema_parameters")
+        incoming = state_dict["ema_parameters"]
+        if len(incoming) != len(self.ema_parameters) or any(
+                p.shape != q.shape for p, q in zip(incoming, self.ema_parameters)):
+            raise ValueError("EMA parameter schema mismatch")
+        self.decay = state_dict["decay"]
+        self.update_step_interval = state_dict.get("update_step_interval", self.update_step_interval)
+        self.ema_parameters = [p.clone() for p in state_dict["ema_parameters"]]
         self.to(self.device)
 
     def state_dict(self) -> dict:
         return {
             "decay": self.decay,
+            "update_step_interval": self.update_step_interval,
             "ema_parameters": self.ema_parameters,
         }

@@ -21,8 +21,20 @@ from clip_benchmark.metrics import zeroshot_classification as zsc
 zsc.tqdm = lambda it, *args, **kwargs: it
 
 DEVICE = "cuda"
-MY_CONFIG_PATH="/opt/tiger/helloworld/reward-server/mmdetection/configs/mask2former/mask2former_swin-s-p4-w7-224_lsj_8x2_50e_coco.py"
-MY_CKPT_PATH="/opt/tiger/helloworld/reward-server"
+REWARD_SERVER_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+PROJECT_ROOT = os.path.dirname(REWARD_SERVER_ROOT)
+MY_CONFIG_PATH = os.environ.get(
+    "GENEVAL_CONFIG_PATH",
+    os.path.join(
+        PROJECT_ROOT,
+        "third_party",
+        "mmdetection",
+        "configs",
+        "mask2former",
+        "mask2former_swin-s-p4-w7-224_lsj_8x2_50e_coco.py",
+    ),
+)
+MY_CKPT_PATH = os.environ.get("GENEVAL_CKPT_PATH", REWARD_SERVER_ROOT)
 
 def load_geneval():
     def timed(fn):
@@ -38,10 +50,7 @@ def load_geneval():
 
     @timed
     def load_models():
-        CONFIG_PATH = os.path.join(
-                os.path.dirname(mmdet.__file__),
-                MY_CONFIG_PATH
-            )
+        CONFIG_PATH = os.path.abspath(MY_CONFIG_PATH)
         OBJECT_DETECTOR = "mask2former_swin-s-p4-w7-224_lsj_8x2_50e_coco"
         CKPT_PATH = os.path.join(MY_CKPT_PATH, f"{OBJECT_DETECTOR}.pth")
         object_detector = init_detector(CONFIG_PATH, CKPT_PATH, device=DEVICE)
@@ -50,7 +59,7 @@ def load_geneval():
         clip_model, _, transform = open_clip.create_model_and_transforms(clip_arch, pretrained="openai", device=DEVICE)
         tokenizer = open_clip.get_tokenizer(clip_arch)
 
-        with open(os.path.join(os.getcwd(), "reward_server/object_names.txt")) as cls_file:
+        with open(os.path.join(REWARD_SERVER_ROOT, "reward_server/object_names.txt")) as cls_file:
             classnames = [line.strip() for line in cls_file]
 
         return object_detector, (clip_model, transform, tokenizer), classnames

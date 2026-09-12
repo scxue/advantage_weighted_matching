@@ -1,5 +1,5 @@
 import os
-NUM_DEVICES = 8
+NUM_DEVICES = int(os.environ.get("GENEVAL_NUM_DEVICES", "8"))
 USED_DEVICES = set()
 
 # reward='deqa'

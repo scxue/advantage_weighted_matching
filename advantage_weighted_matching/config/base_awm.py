@@ -27,6 +27,12 @@ def get_config():
     # containing checkpoints, in which case the latest one will be used. `config.use_lora` must be set to the same value
     # as the run that generated the saved checkpoint.
     config.resume_from = ""
+    # Opt-in legacy 4-node input schedule with topology-independent logical RNGs.
+    config.logical_ranks = 0
+    # Rollout batches per logical rank (Geneval/OCR: 9, PickScore: 3).
+    config.logical_rounds = 9
+    config.checkpoint_every_steps = 10
+    config.wandb_run_id = ""
     # whether or not to use LoRA.
     config.use_lora = True
     config.dataset = ""
@@ -94,8 +100,16 @@ def get_config():
     # the fraction of timesteps to train on. if set to less than 1.0, the model will be trained on a subset of the
     # timesteps for each sample. this will speed up training but reduce the accuracy of policy gradient estimates.
     train.timestep_fraction = 1.0
+    # Same prompt/epoch shares training times and per-time noise; rollout is unchanged.
+    train.share_prompt_training_noise = False
     # kl ratio
     train.beta = 0.0
+    # CFG scale used only by the frozen base-model reference in the base KL.
+    # 1.0 runs one conditional forward; values above 1.0 run separate
+    # unconditional and conditional forwards and combine them with CFG.
+    train.base_kl_cfg_scale = 1.0
+    # Per-optimizer-step linear ramp rate for the EMA-KL reference decay.
+    train.kl_ema_decay_rate = 0.001
     # pretrained lora path
     train.lora_path = None
     train.ema = False

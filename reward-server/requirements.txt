@@ -1,3 +1,5 @@
+# Legacy broad environment export. For Geneval use requirements-geneval.txt
+# through setup/02_setup_env_reward_server.sh; do not combine the two lists.
 absl-py==2.1.0
 addict==2.4.0
 aiofiles==23.2.1

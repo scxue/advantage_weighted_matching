@@ -1,6 +1,7 @@
 from collections import defaultdict
 import contextlib
 import os
+os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
 import datetime
 from concurrent import futures
 import time
@@ -19,6 +20,10 @@ import numpy as np
 import flow_grpo.prompts
 import flow_grpo.rewards
 from flow_grpo.stat_tracking import PerPromptStatTracker
+from flow_grpo.wandb_logging import TrainingStepLogger
+from flow_grpo.prompt_noise import (
+    DISCRETE_TIME_TYPES, prompt_training_seed, shared_prompt_training_inputs,
+)
 from flow_grpo.diffusers_patch.sd3_pipeline_with_logprob import pipeline_with_logprob
 from flow_grpo.diffusers_patch.sd3_sde_with_logprob import sde_step_with_logprob
 from flow_grpo.diffusers_patch.train_dreambooth_lora_sd3 import encode_prompt
@@ -30,6 +35,11 @@ from functools import partial
 import tqdm
 import tempfile
 import itertools
+import gc
+from flow_grpo.resume import (
+    Legacy32Layout, LogicalState, LogicalEvalLoader, capture_rng, preserve_rng,
+    broadcast, signature, read_metadata, save_checkpoint, load_checkpoint,
+)
 from PIL import Image
 from peft import LoraConfig, get_peft_model, set_peft_model_state_dict, PeftModel
 from peft.utils import get_peft_model_state_dict
@@ -207,8 +217,68 @@ def get_sigmas(noise_scheduler, timesteps, accelerator, n_dim=4, dtype=torch.flo
     return sigma
 
 
-def compute_log_prob_awm(transformer, pipeline, sample, timestep, embeds, pooled_embeds, config, noised_latents, clean_latents, random_noise, weighting='Uniform'):
-    if config.train.cfg:
+def _predict_model_output_with_cfg(
+    transformer,
+    noised_latents,
+    timestep,
+    embeds,
+    pooled_embeds,
+    cfg_scale,
+    negative_embeds=None,
+    negative_pooled_embeds=None,
+):
+    cfg_scale = float(cfg_scale)
+    if cfg_scale < 1.0:
+        raise ValueError(f"CFG scale must be at least 1.0, got {cfg_scale}")
+
+    def run_transformer(prompt_embeds, prompt_pooled_embeds):
+        return transformer(
+            hidden_states=noised_latents,
+            timestep=timestep.view(-1) * 1000,
+            encoder_hidden_states=prompt_embeds,
+            pooled_projections=prompt_pooled_embeds,
+            return_dict=False,
+        )[0]
+
+    if cfg_scale == 1.0:
+        return run_transformer(embeds, pooled_embeds)
+
+    if negative_embeds is None or negative_pooled_embeds is None:
+        raise ValueError("Negative prompt embeddings are required when CFG scale is greater than 1.0")
+
+    model_output_uncond = run_transformer(negative_embeds, negative_pooled_embeds)
+    model_output_cond = run_transformer(embeds, pooled_embeds)
+    return model_output_uncond + cfg_scale * (model_output_cond - model_output_uncond)
+
+
+def compute_log_prob_awm(
+    transformer,
+    pipeline,
+    sample,
+    timestep,
+    embeds,
+    pooled_embeds,
+    config,
+    noised_latents,
+    clean_latents,
+    random_noise,
+    weighting='Uniform',
+    cfg_scale_override=None,
+    negative_embeds=None,
+    negative_pooled_embeds=None,
+):
+    if cfg_scale_override is not None:
+        noise_pred = _predict_model_output_with_cfg(
+            transformer,
+            noised_latents,
+            timestep,
+            embeds,
+            pooled_embeds,
+            cfg_scale_override,
+            negative_embeds=negative_embeds,
+            negative_pooled_embeds=negative_pooled_embeds,
+        )
+    elif config.train.cfg:
         noise_pred = transformer(
             hidden_states=torch.cat([noised_latents] * 2),
             timestep=torch.cat([timestep.view(-1)*1000] * 2),
@@ -234,8 +304,8 @@ def compute_log_prob_awm(transformer, pipeline, sample, timestep, embeds, pooled
     sigma = timestep
 
     std_dev_t = torch.sqrt(sigma / (1 - torch.clamp(sigma, 0, 0.99)))*0.7
-    model_output = noise_pred.double()
-    log_prob = -(model_output - (random_noise.double() - clean_latents.double()))**2
+    model_output = noise_pred.float()
+    log_prob = -(model_output - (random_noise.float() - clean_latents.float()))**2
     log_prob = log_prob.mean(dim=tuple(range(1, log_prob.ndim)))
     if weighting == 't':
         log_prob = log_prob * timestep.view(-1)
@@ -274,21 +344,14 @@ def logit_normal_shifted_sampler(shape, m=0.0, s=1.0, shift=3.0, device='cpu'):
     return t
     
 
-def eval(pipeline, test_dataloader, text_encoders, tokenizers, config, accelerator, global_step, reward_fn, executor, autocast, ema, transformer_trainable_parameters):
-    def log_metrics(data: dict, step=None):
-        """
-        Unified logger: 
-        - accelerator.log 用于保持你原来的逻辑 (不会上传)
-        - wandb.log 用于实际记录
-        """
-        accelerator.log(data, step=step)    # 本地统计逻辑
-        if accelerator.is_main_process:
-            wandb.log(data, step=step)      # 上传到 byted-wandb
+def eval(pipeline, test_dataloader, text_encoders, tokenizers, config, accelerator, global_step, reward_fn, executor, autocast, ema, transformer_trainable_parameters, log_metrics):
     neg_prompt_embed, neg_pooled_prompt_embed = compute_text_embeddings([""], text_encoders, tokenizers, max_sequence_length=128, device=accelerator.device)
 
     sample_neg_prompt_embeds = neg_prompt_embed.repeat(config.sample.test_batch_size, 1, 1)
     sample_neg_pooled_prompt_embeds = neg_pooled_prompt_embed.repeat(config.sample.test_batch_size, 1)
 
+    if isinstance(test_dataloader, LogicalEvalLoader):
+        test_dataloader.ema_mode = False
     # test_dataloader = itertools.islice(test_dataloader, 2)
     all_rewards = defaultdict(list)
     for test_batch in tqdm(
@@ -382,7 +445,10 @@ def eval(pipeline, test_dataloader, text_encoders, tokenizers, config, accelerat
             )
 
     if config.train.ema:
-        ema.copy_ema_to(transformer_trainable_parameters, store_temp=True)
+        if isinstance(test_dataloader, LogicalEvalLoader):
+            test_dataloader.ema_mode = True
+        else:
+            ema.copy_ema_to(transformer_trainable_parameters, store_temp=True)
 
         neg_prompt_embed, neg_pooled_prompt_embed = compute_text_embeddings([""], text_encoders, tokenizers, max_sequence_length=128, device=accelerator.device)
 
@@ -481,12 +547,24 @@ def eval(pipeline, test_dataloader, text_encoders, tokenizers, config, accelerat
                     step=global_step,
                 )
 
-        ema.copy_temp_to(transformer_trainable_parameters)
+        if isinstance(test_dataloader, LogicalEvalLoader):
+            test_dataloader.ema_mode = False
+        else:
+            ema.copy_temp_to(transformer_trainable_parameters)
 
 def unwrap_model(model, accelerator):
-    model = accelerator.unwrap_model(model)
-    model = model._orig_mod if is_compiled_module(model) else model
-    return model
+    # The checked-in launch configs use PyTorch DDP, not DeepSpeed.  Calling
+    # Accelerator.unwrap_model() imports DeepSpeed whenever it is installed,
+    # which makes checkpointing require a CUDA toolkit even though training
+    # never uses DeepSpeed.
+    del accelerator
+    while True:
+        if is_compiled_module(model):
+            model = model._orig_mod
+        elif isinstance(model, (torch.nn.parallel.DistributedDataParallel, torch.nn.DataParallel)):
+            model = model.module
+        else:
+            return model
 
 def save_ckpt(save_dir, transformer, global_step, accelerator, ema, transformer_trainable_parameters, config):
     if accelerator.is_main_process:
@@ -501,70 +579,7 @@ def save_ckpt(save_dir, transformer, global_step, accelerator, ema, transformer_
             unwrap_model(transformer, accelerator).save_pretrained(save_root_lora_ema)
             ema.copy_temp_to(transformer_trainable_parameters)
 
-def main(_):
-    # basic Accelerate and logging setup
-    config = FLAGS.config
-
-    # unique_id = datetime.datetime.now().strftime("%Y.%m.%d_%H.%M.%S")
-    unique_id = datetime.datetime.now().strftime("%m.%d_%H")
-    if not config.run_name:
-        config.run_name = unique_id
-    else:
-        config.run_name += "_" + unique_id
-
-    if config.resume_from:
-        config.resume_from = os.path.normpath(os.path.expanduser(config.resume_from))
-        if "checkpoint_" not in os.path.basename(config.resume_from):
-            # get the most recent checkpoint in this directory
-            checkpoints = list(
-                filter(lambda x: "checkpoint_" in x, os.listdir(config.resume_from))
-            )
-            if len(checkpoints) == 0:
-                raise ValueError(f"No checkpoints found in {config.resume_from}")
-            config.resume_from = os.path.join(
-                config.resume_from,
-                sorted(checkpoints, key=lambda x: int(x.split("_")[-1]))[-1],
-            )
-
-    accelerator_config = ProjectConfiguration(
-        project_dir=os.path.join(config.logdir, config.run_name),
-        automatic_checkpoint_naming=True,
-        total_limit=config.num_checkpoint_limit,
-    )
-
-    accelerator = Accelerator(
-        log_with=None,
-        mixed_precision=config.mixed_precision,
-        project_config=accelerator_config,
-        gradient_accumulation_steps=config.train.gradient_accumulation_steps, # we deal with gradient accumulation logic in the given configs
-    )
-    if accelerator.is_main_process:
-        # accelerator.init_trackers(
-        #     project_name="sxue_RL",
-        #     config=config.to_dict(),
-        #     init_kwargs={"wandb": {"name": config.run_name}},
-        # )
-        wandb.init(
-            project="sxue_RL",
-            name=config.run_name,
-            config=config.to_dict(),
-        )
-    def log_metrics(data: dict, step=None):
-        """
-        Unified logger: 
-        - accelerator.log 用于保持你原来的逻辑 (不会上传)
-        - wandb.log 用于实际记录
-        """
-        accelerator.log(data, step=step)    # 本地统计逻辑
-        if accelerator.is_main_process:
-            wandb.log(data, step=step)      # 上传到 byted-wandb
-
-
-    logger.info(f"\n{config}")
-
-    # set seed (device_specific is very important to get different prompts on different devices)
-    set_seed(config.seed, device_specific=True)
-
+def initialize_pipeline(config, accelerator):
     # load scheduler, tokenizer and models.
     pipeline = StableDiffusion3Pipeline.from_pretrained(
         config.pretrained.model
@@ -658,6 +673,100 @@ def main(_):
         tgt_param.data.copy_(src_param.detach().data)
         assert src_param is not tgt_param
 
+
+    return pipeline, text_encoders, tokenizers, transformer, transformer_trainable_parameters, ema, ema_transformer_trainable_parameters
+
+
+def main(_):
+    # basic Accelerate and logging setup
+    config = FLAGS.config
+    share_prompt_noise = config.train.get("share_prompt_training_noise", False)
+    if share_prompt_noise and config.time_type not in DISCRETE_TIME_TYPES:
+        raise ValueError("share_prompt_training_noise requires a discrete time_type")
+    if config.logical_ranks and config.checkpoint_every_steps < 1:
+        raise ValueError("checkpoint_every_steps must be positive")
+    if share_prompt_noise and "shared_prompt_noise" not in config.run_name:
+        config.run_name = (config.run_name + "_shared_prompt_noise").lstrip("_")
+
+    # unique_id = datetime.datetime.now().strftime("%Y.%m.%d_%H.%M.%S")
+    unique_id = datetime.datetime.now().strftime("%m.%d_%H")
+    if not config.run_name:
+        config.run_name = unique_id
+    else:
+        config.run_name += "_" + unique_id
+
+    resume_metadata = None
+    if config.resume_from:
+        if not config.logical_ranks or config.train.lora_path:
+            raise ValueError("Full resume requires logical_ranks=32 and no lora_path override")
+        resume_path, resume_metadata = read_metadata(config.resume_from)
+        config.resume_from = str(resume_path)
+        config.save_dir = resume_metadata["save_dir"]
+        config.run_name = resume_metadata["run_name"]
+        config.wandb_run_id = resume_metadata["wandb_run_id"]
+
+    accelerator_config = ProjectConfiguration(
+        project_dir=os.path.join(config.logdir, config.run_name),
+        automatic_checkpoint_naming=True,
+        total_limit=config.num_checkpoint_limit,
+    )
+
+    accelerator = Accelerator(
+        log_with=None,
+        mixed_precision=config.mixed_precision,
+        project_config=accelerator_config,
+        gradient_accumulation_steps=config.train.gradient_accumulation_steps, # we deal with gradient accumulation logic in the given configs
+    )
+    config.save_dir = broadcast(config.save_dir if accelerator.is_main_process else None)
+    config.run_name = broadcast(config.run_name if accelerator.is_main_process else None)
+    wandb_logger = None
+    if accelerator.is_main_process:
+        # accelerator.init_trackers(
+        #     project_name="sxue_RL",
+        #     config=config.to_dict(),
+        #     init_kwargs={"wandb": {"name": config.run_name}},
+        # )
+        wandb.init(
+            project="sxue_RL",
+            name=config.run_name,
+            config=config.to_dict(),
+            id=config.wandb_run_id or None,
+            resume="must" if config.resume_from else "allow",
+        )
+        config.wandb_run_id = wandb.run.id
+        wandb.define_metric("train/global_step")
+        wandb.define_metric("*", step_metric="train/global_step")
+        wandb_logger = TrainingStepLogger(wandb.log, next_step=wandb.run.step)
+    config.wandb_run_id = broadcast(config.wandb_run_id if accelerator.is_main_process else None)
+    def log_metrics(data: dict, step=None):
+        # Keep local logging unchanged, including replayed steps after resume.
+        accelerator.log(data, step=step)
+        if accelerator.is_main_process:
+            wandb_logger.log(data, step=step)
+
+
+    logger.info(f"\n{config}")
+
+    # set seed (device_specific is very important to get different prompts on different devices)
+    set_seed(config.seed, device_specific=True)
+
+    secondary_states = {}
+    if config.logical_ranks:
+        for logical_rank in range(accelerator.process_index + accelerator.num_processes, 32, accelerator.num_processes):
+            # Reproduce the old rank's initialization (including LoRA RNG consumption).
+            # The temporary pipeline is discarded; training uses one shared policy.
+            with preserve_rng(accelerator.device):
+                set_seed(config.seed + logical_rank)
+                temporary = initialize_pipeline(config, accelerator)
+                secondary_states[logical_rank] = (capture_rng(accelerator.device), temporary[5])
+                del temporary
+                gc.collect()
+                torch.cuda.empty_cache()
+
+    # Construct the persistent pipeline last, so a second full SD3 model never
+    # shares GPU memory with it during logical-rank initialization.
+    pipeline, text_encoders, tokenizers, transformer, transformer_trainable_parameters, ema, ema_transformer_trainable_parameters = initialize_pipeline(config, accelerator)
+    initial_rng = capture_rng(accelerator.device)
 
     # Enable TF32 for faster training on Ampere GPUs,
     # cf https://pytorch.org/docs/stable/notes/cuda.html#tensorfloat-32-tf32-on-ampere-devices
@@ -790,7 +899,29 @@ def main(_):
     # autocast = accelerator.autocast
 
     # Prepare everything with our `accelerator`.
-    transformer, optimizer, train_dataloader, test_dataloader = accelerator.prepare(transformer, optimizer, train_dataloader, test_dataloader)
+    logical = None
+    if config.logical_ranks:
+        layout = Legacy32Layout.from_config(
+            config, len(train_dataset), accelerator.num_processes, accelerator.process_index)
+        transformer, optimizer = accelerator.prepare(transformer, optimizer)
+        after_setup = capture_rng(accelerator.device)
+        # Post-model setup must not introduce untracked rank-dependent random draws.
+        if not torch.equal(initial_rng["cpu"], after_setup["cpu"]) or (
+                initial_rng["cuda"] is not None and not torch.equal(initial_rng["cuda"], after_setup["cuda"])):
+            raise RuntimeError("Unexpected RNG consumption between model initialization and logical-state setup")
+        rngs = {accelerator.process_index: after_setup}
+        emas = {accelerator.process_index: ema}
+        for logical_rank, (rng, shadow) in secondary_states.items():
+            rngs[logical_rank], emas[logical_rank] = rng, shadow
+        logical = LogicalState(layout, accelerator.device, rngs, emas)
+        for logical_rank in layout.logical_ids:
+            with logical.use(logical_rank):
+                # Match the original infinite training DataLoader's one iterator base-seed draw.
+                torch.empty((), dtype=torch.int64).random_()
+        test_dataloader = LogicalEvalLoader(test_dataset, logical, transformer_trainable_parameters)
+        run_signature = signature(config, [train_dataset.file_path, test_dataset.file_path])
+    else:
+        transformer, optimizer, train_dataloader, test_dataloader = accelerator.prepare(transformer, optimizer, train_dataloader, test_dataloader)
 
     # executor to perform callbacks asynchronously. this is beneficial for the llava callbacks which makes a request to a
     # remote server running llava inference.
@@ -824,22 +955,17 @@ def main(_):
         f"  Number of gradient updates per epoch = {samples_per_epoch // total_train_batch_size}"
     )
 
+    first_epoch, global_step = 0, 0
     if config.resume_from:
-        logger.info(f"Resuming from {config.resume_from}")
-        accelerator.load_state(config.resume_from)
-        first_epoch = int(config.resume_from.split("_")[-1]) + 1
-    else:
-        first_epoch = 0
-    global_step = 0
-    if config.train.lora_path:
-        parts = config.train.lora_path.split('/')
-        checkpoint_folder = parts[-2]
-        step_str = checkpoint_folder.split('-')[-1]
-        global_step = int(step_str)
-        first_epoch = global_step // 2 + 3
-        if accelerator.is_main_process:
-            print(f"global_step: {global_step}, first_epoch: {first_epoch}")
-    train_iter = iter(train_dataloader)
+        resume_metadata = load_checkpoint(config.resume_from, unwrap_model(transformer, accelerator),
+                                          optimizer, lr_scheduler, accelerator, logical, run_signature)
+        first_epoch, global_step = resume_metadata["next_epoch"], resume_metadata["global_step"]
+        if config.per_prompt_stat_tracking:
+            stat_tracker.history_prompts = set(resume_metadata["history_prompts"])
+        logger.info(f"Resumed epoch={first_epoch}, step={global_step}, logical ranks={layout.logical_ids}")
+    elif config.train.lora_path:
+        logger.warning("lora_path is a weight-only warm start; optimizer, EMA and progress start fresh")
+    train_iter = None if logical else iter(train_dataloader)
 
     for epoch in range(first_epoch, config.num_epochs):
         epoch_start_time = time.time()
@@ -849,14 +975,21 @@ def main(_):
         pipeline.transformer.eval()
         samples = []
         prompts = []
+        if logical and epoch % config.eval_freq == 0 and epoch > 0:
+            eval(pipeline, test_dataloader, text_encoders, tokenizers, config, accelerator,
+                 global_step, eval_reward_fn, executor, autocast, ema, transformer_trainable_parameters, log_metrics)
         for i in tqdm(
             range(config.sample.num_batches_per_epoch),
             desc=f"Epoch {epoch}: sampling",
             disable=not accelerator.is_local_main_process,
             position=0,
         ):
-            train_sampler.set_epoch(epoch * config.sample.num_batches_per_epoch + i)
-            prompts, prompt_metadata = next(train_iter)
+            if logical:
+                logical_rank, indices = layout.rollout(epoch, i)
+                prompts, prompt_metadata = train_dataset.collate_fn([train_dataset[j] for j in indices])
+            else:
+                train_sampler.set_epoch(epoch * config.sample.num_batches_per_epoch + i)
+                prompts, prompt_metadata = next(train_iter)
 
             prompt_embeds, pooled_prompt_embeds = compute_text_embeddings(
                 prompts, 
@@ -872,9 +1005,9 @@ def main(_):
                 truncation=True,
                 return_tensors="pt",
             ).input_ids.to(accelerator.device)
-            if i==0 and epoch % config.eval_freq == 0 and epoch>0:
-                eval(pipeline, test_dataloader, text_encoders, tokenizers, config, accelerator, global_step, eval_reward_fn, executor, autocast, ema, transformer_trainable_parameters)
-            if i==0 and epoch % config.save_freq == 0 and epoch>0 and accelerator.is_main_process:
+            if not logical and i==0 and epoch % config.eval_freq == 0 and epoch>0:
+                eval(pipeline, test_dataloader, text_encoders, tokenizers, config, accelerator, global_step, eval_reward_fn, executor, autocast, ema, transformer_trainable_parameters, log_metrics)
+            if not logical and i==0 and epoch % config.save_freq == 0 and epoch>0 and accelerator.is_main_process:
                 save_ckpt(config.save_dir, transformer, global_step, accelerator, ema, transformer_trainable_parameters, config)
             # this is intentional, because the group size collected in the first two epochs has a bug, after two epochs, the group_size stabilizes to the specified value
             if epoch < 2:
@@ -882,7 +1015,7 @@ def main(_):
             # sample
             if config.train.off_policy:
                 transformer.module.set_adapter('ema')
-            with autocast():
+            with (logical.use(logical_rank) if logical else contextlib.nullcontext()), autocast():
                 with torch.no_grad():
                     images, latents = pipeline_with_logprob(
                         pipeline,
@@ -968,7 +1101,8 @@ def main(_):
             # this is a hack to force wandb to log the images as JPEGs instead of PNGs
             with tempfile.TemporaryDirectory() as tmpdir:
                 num_samples = min(15, len(images))
-                sample_indices = random.sample(range(len(images)), num_samples)
+                with (logical.use(0) if logical else contextlib.nullcontext()):
+                    sample_indices = random.sample(range(len(images)), num_samples)
 
                 for idx, i in enumerate(sample_indices):
                     image = images[i]
@@ -997,7 +1131,8 @@ def main(_):
         samples["rewards"]["avg"] = samples["rewards"]["avg"].unsqueeze(-1) # DO NOT use kl_reward
         # gather rewards across processes
         gathered_rewards = {key: accelerator.gather(value) for key, value in samples["rewards"].items()}
-        gathered_rewards = {key: value.cpu().numpy() for key, value in gathered_rewards.items()}
+        gathered_rewards = {key: (layout.canonical(value) if logical else value).cpu().numpy()
+                            for key, value in gathered_rewards.items()}
         # log rewards and images
         log_metrics(
             {
@@ -1012,7 +1147,8 @@ def main(_):
         # per-prompt mean/std tracking
         if config.per_prompt_stat_tracking:
             # gather the prompts across processes
-            prompt_ids = accelerator.gather(samples["prompt_ids"]).cpu().numpy()
+            prompt_ids = accelerator.gather(samples["prompt_ids"])
+            prompt_ids = (layout.canonical(prompt_ids) if logical else prompt_ids).cpu().numpy()
             prompts = pipeline.tokenizer.batch_decode(
                 prompt_ids, skip_special_tokens=True
             )
@@ -1043,38 +1179,65 @@ def main(_):
         # ungather advantages; we only need to keep the entries corresponding to the samples on this process
         advantages = torch.as_tensor(advantages)
         samples["advantages"] = (
-            advantages.reshape(accelerator.num_processes, -1, advantages.shape[-1])[accelerator.process_index]
+            (layout.local(advantages) if logical else
+             advantages.reshape(accelerator.num_processes, -1, advantages.shape[-1])[accelerator.process_index])
             .to(accelerator.device)
         )
         if accelerator.is_local_main_process:
             print("advantages: ", samples["advantages"].abs().mean())
 
+        if share_prompt_noise:
+            # Match the advantage group's decoded text, including repeated
+            # prompts across rollout rounds. Carry keys through shuffle/rebatch.
+            local_prompts = pipeline.tokenizer.batch_decode(
+                samples["prompt_ids"].cpu().numpy(), skip_special_tokens=True)
+            samples["prompt_noise_seed"] = torch.tensor(
+                [prompt_training_seed(config.seed, epoch, prompt) for prompt in local_prompts],
+                dtype=torch.long, device=accelerator.device)
+
         del samples["rewards"]
         del samples["prompt_ids"]
 
-        # Get the mask for samples where all advantages are zero across the time dimension
-        mask = (samples["advantages"].abs().sum(dim=1) != 0)
-        
-        # If the number of True values in mask is not divisible by config.sample.num_batches_per_epoch,
-        # randomly change some False values to True to make it divisible
-        num_batches = config.sample.num_batches_per_epoch
-        true_count = mask.sum()
-        if true_count % num_batches != 0:
-            false_indices = torch.where(~mask)[0]
-            num_to_change = num_batches - (true_count % num_batches)
-            if len(false_indices) >= num_to_change:
-                random_indices = torch.randperm(len(false_indices))[:num_to_change]
-                mask[false_indices[random_indices]] = True
-        log_metrics(
-            {
-                "actual_batch_size": mask.sum().item()//config.sample.num_batches_per_epoch,
-            },
-            step=global_step,
-        )
-        # Filter out samples where the entire time dimension of advantages is zero
-        # samples = {k: v[mask] for k, v in samples.items()}
-        # here we do not filter out samples where the entire time dimension of advantages is zero
-        # to avoid the conflict with gradient accumulation in our logic
+        if logical:
+            # Keep the legacy diagnostic's CPU RNG draws independently per logical rank.
+            actual_sizes = []
+            for slot, logical_rank in enumerate(layout.logical_ids):
+                size, rounds = layout.images_per_rank, layout.rounds
+                mask = samples["advantages"][slot*size:(slot+1)*size].abs().sum(dim=1) != 0
+                with logical.use(logical_rank):
+                    count = int(mask.sum())
+                    if count % rounds:
+                        false_indices = torch.where(~mask)[0]
+                        num_to_change = rounds - count % rounds
+                        if len(false_indices) >= num_to_change:
+                            chosen = torch.randperm(len(false_indices))[:num_to_change]
+                            mask[false_indices[chosen]] = True
+                actual_sizes.append(int(mask.sum()) // rounds)
+            log_metrics({"actual_batch_size": float(np.mean(actual_sizes))}, step=global_step)
+        else:
+            # Get the mask for samples where all advantages are zero across the time dimension
+            mask = (samples["advantages"].abs().sum(dim=1) != 0)
+
+            # If the number of True values in mask is not divisible by config.sample.num_batches_per_epoch,
+            # randomly change some False values to True to make it divisible
+            num_batches = config.sample.num_batches_per_epoch
+            true_count = mask.sum()
+            if true_count % num_batches != 0:
+                false_indices = torch.where(~mask)[0]
+                num_to_change = num_batches - (true_count % num_batches)
+                if len(false_indices) >= num_to_change:
+                    random_indices = torch.randperm(len(false_indices))[:num_to_change]
+                    mask[false_indices[random_indices]] = True
+            log_metrics(
+                {
+                    "actual_batch_size": mask.sum().item()//config.sample.num_batches_per_epoch,
+                },
+                step=global_step,
+            )
+            # Filter out samples where the entire time dimension of advantages is zero
+            # samples = {k: v[mask] for k, v in samples.items()}
+            # here we do not filter out samples where the entire time dimension of advantages is zero
+            # to avoid the conflict with gradient accumulation in our logic
 
         total_batch_size, num_timesteps = samples["timesteps"].shape
         assert num_timesteps == config.sample.num_steps
@@ -1083,7 +1246,7 @@ def main(_):
         #################### TRAINING ####################
         training_start_time = time.time()
         # shuffle samples along batch dimension
-        perm = torch.randperm(total_batch_size, device=accelerator.device)
+        perm = logical.permutation() if logical else torch.randperm(total_batch_size, device=accelerator.device)
         samples = {k: v[perm] for k, v in samples.items()}
 
         # shuffle along time dimension independently for each sample
@@ -1111,6 +1274,10 @@ def main(_):
             dict(zip(samples_batched, x)) for x in zip(*samples_batched.values())
         ]
 
+        if logical:
+            for batch_index, batch in enumerate(samples_batched):
+                batch["_logical_rank"] = layout.logical_ids[batch_index // layout.train_batches]
+
         # train
         pipeline.transformer.train()
         info = defaultdict(list)
@@ -1135,109 +1302,122 @@ def main(_):
                 pooled_embeds = sample["pooled_prompt_embeds"]
 
 
-            if config.time_type == 'logit_normal':
-                # continuous t
-                # same t with stratified sampling
-                T = config.train.train_timesteps
-                B = config.train.batch_size
+            with (logical.use(sample["_logical_rank"]) if logical else contextlib.nullcontext()):
+                if config.time_type == 'logit_normal':
+                    # continuous t
+                    # same t with stratified sampling
+                    T = config.train.train_timesteps
+                    B = config.train.batch_size
 
-                base_uniform_vector = (torch.arange(T, device=accelerator.device) + torch.rand(T, device=accelerator.device)) / T
+                    base_uniform_vector = (torch.arange(T, device=accelerator.device) + torch.rand(T, device=accelerator.device)) / T
 
-                normal_dist = torch.distributions.Normal(loc=0.0, scale=1.0)
-                u_standard_vector = normal_dist.icdf(torch.clamp(base_uniform_vector, 1e-7, 1-1e-7))
-                u_standard_vector = normal_dist.icdf(base_uniform_vector)
+                    normal_dist = torch.distributions.Normal(loc=0.0, scale=1.0)
+                    u_standard_vector = normal_dist.icdf(torch.clamp(base_uniform_vector, 1e-7, 1-1e-7))
+                    u_standard_vector = normal_dist.icdf(base_uniform_vector)
 
-                # 3. shuffle this vector randomly
-                u_standard_shuffled = u_standard_vector[torch.randperm(T, device=accelerator.device)]
+                    # 3. shuffle this vector randomly
+                    u_standard_shuffled = u_standard_vector[torch.randperm(T, device=accelerator.device)]
 
-                m, s, shift = 0.0, 1.0, config.time_shift
-                u = u_standard_shuffled * s + m
-                t_vector = torch.sigmoid(u)
-                t_vector_shifted = shift * t_vector / (1 + (shift - 1) * t_vector)
+                    m, s, shift = 0.0, 1.0, config.time_shift
+                    u = u_standard_shuffled * s + m
+                    t_vector = torch.sigmoid(u)
+                    t_vector_shifted = shift * t_vector / (1 + (shift - 1) * t_vector)
 
-                timesteps = torch.repeat_interleave(t_vector_shifted, repeats=B)
-                timesteps = torch.clamp(timesteps, min=0.01)
-                timesteps = timesteps.view(-1, 1, 1, 1)
+                    timesteps = torch.repeat_interleave(t_vector_shifted, repeats=B)
+                    timesteps = torch.clamp(timesteps, min=0.01)
+                    timesteps = timesteps.view(-1, 1, 1, 1)
 
-            elif config.time_type == 'uniform':
-                global_lower, global_upper = 0.20, 1.0
-                rand_u = torch.rand(config.train.train_timesteps, config.train.batch_size, device=accelerator.device)
-                normalized_matrix = (torch.arange(config.train.train_timesteps, device=accelerator.device).unsqueeze(1) + rand_u) / config.train.train_timesteps
-                
-                matrix = global_lower + normalized_matrix * (global_upper - global_lower)
-                timesteps = torch.gather(matrix, 0, torch.rand_like(matrix).argsort(dim=0)).flatten()
-                timesteps = config.time_shift * timesteps / (1 + (config.time_shift - 1) * timesteps)
-                timesteps = timesteps.view(-1,1,1,1)
+                elif config.time_type == 'uniform':
+                    global_lower, global_upper = 0.20, 1.0
+                    rand_u = torch.rand(config.train.train_timesteps, config.train.batch_size, device=accelerator.device)
+                    normalized_matrix = (torch.arange(config.train.train_timesteps, device=accelerator.device).unsqueeze(1) + rand_u) / config.train.train_timesteps
 
-            elif config.time_type == 'discrete':
-                boundaries = torch.linspace(0, int(config.sample.num_steps * config.train.timestep_fraction), steps=config.train.train_timesteps + 1, device=accelerator.device)
-                lower_bounds = boundaries[:-1].long()
-                upper_bounds = boundaries[1:].long()
-                rand_u = torch.rand(config.train.train_timesteps, device=accelerator.device)
-                t_indices = lower_bounds + (rand_u * (upper_bounds - lower_bounds)).long()
+                    matrix = global_lower + normalized_matrix * (global_upper - global_lower)
+                    timesteps = torch.gather(matrix, 0, torch.rand_like(matrix).argsort(dim=0)).flatten()
+                    timesteps = config.time_shift * timesteps / (1 + (config.time_shift - 1) * timesteps)
+                    timesteps = timesteps.view(-1,1,1,1)
 
-                train_totalindex = torch.repeat_interleave(t_indices, repeats=config.train.batch_size) # [12]
-                timesteps = sample["timesteps"][0][train_totalindex].view(-1,1,1,1) / 1000 # [12, 1, 1, 1]
-            elif config.time_type == 'discrete_with_init':
-                init_index = torch.tensor([0], device=accelerator.device, dtype=torch.long)
-                num_remaining = config.train.train_timesteps - 1
-                if num_remaining > 0:
-                    max_step_idx = int(config.sample.num_steps * config.train.timestep_fraction)
-                    boundaries = torch.linspace(1, max_step_idx, steps=num_remaining + 1, device=accelerator.device)
+                elif config.time_type == 'discrete':
+                    boundaries = torch.linspace(0, int(config.sample.num_steps * config.train.timestep_fraction), steps=config.train.train_timesteps + 1, device=accelerator.device)
                     lower_bounds = boundaries[:-1].long()
-                    upper_bounds = boundaries[1:].long()                
-                    rand_u = torch.rand(num_remaining, device=accelerator.device)
-                    remaining_indices = lower_bounds + (rand_u * (upper_bounds - lower_bounds)).long()
-                    t_indices = torch.cat([init_index, remaining_indices])
+                    upper_bounds = boundaries[1:].long()
+                    rand_u = torch.rand(config.train.train_timesteps, device=accelerator.device)
+                    t_indices = lower_bounds + (rand_u * (upper_bounds - lower_bounds)).long()
+
+                    train_totalindex = torch.repeat_interleave(t_indices, repeats=config.train.batch_size) # [12]
+                    timesteps = sample["timesteps"][0][train_totalindex].view(-1,1,1,1) / 1000 # [12, 1, 1, 1]
+                elif config.time_type == 'discrete_with_init':
+                    init_index = torch.tensor([0], device=accelerator.device, dtype=torch.long)
+                    num_remaining = config.train.train_timesteps - 1
+                    if num_remaining > 0:
+                        max_step_idx = int(config.sample.num_steps * config.train.timestep_fraction)
+                        boundaries = torch.linspace(1, max_step_idx, steps=num_remaining + 1, device=accelerator.device)
+                        lower_bounds = boundaries[:-1].long()
+                        upper_bounds = boundaries[1:].long()
+                        rand_u = torch.rand(num_remaining, device=accelerator.device)
+                        remaining_indices = lower_bounds + (rand_u * (upper_bounds - lower_bounds)).long()
+                        t_indices = torch.cat([init_index, remaining_indices])
+                    else:
+                        t_indices = init_index
+
+                    train_totalindex = torch.repeat_interleave(t_indices, repeats=config.train.batch_size) # [12]
+                    timesteps = sample["timesteps"][0][train_totalindex].view(-1,1,1,1) / 1000 # [12, 1, 1, 1]
+                elif config.time_type == 'discrete_wo_init':
+                    boundaries = torch.linspace(1, int(config.sample.num_steps * config.train.timestep_fraction), steps=config.train.train_timesteps + 1, device=accelerator.device)
+                    lower_bounds = boundaries[:-1].long()
+                    upper_bounds = boundaries[1:].long()
+                    rand_u = torch.rand(config.train.train_timesteps, device=accelerator.device)
+                    t_indices = lower_bounds + (rand_u * (upper_bounds - lower_bounds)).long()
+
+                    train_totalindex = torch.repeat_interleave(t_indices, repeats=config.train.batch_size) # [12]
+                    timesteps = sample["timesteps"][0][train_totalindex].view(-1,1,1,1) / 1000 # [12, 1, 1, 1]
                 else:
-                    t_indices = init_index
+                    raise NotImplementedError("Only logit_normal, uniform, and discrete are supported with time_type")
 
-                train_totalindex = torch.repeat_interleave(t_indices, repeats=config.train.batch_size) # [12]
-                timesteps = sample["timesteps"][0][train_totalindex].view(-1,1,1,1) / 1000 # [12, 1, 1, 1]
-            elif config.time_type == 'discrete_wo_init':
-                boundaries = torch.linspace(1, int(config.sample.num_steps * config.train.timestep_fraction), steps=config.train.train_timesteps + 1, device=accelerator.device)
-                lower_bounds = boundaries[:-1].long()
-                upper_bounds = boundaries[1:].long()
-                rand_u = torch.rand(config.train.train_timesteps, device=accelerator.device)
-                t_indices = lower_bounds + (rand_u * (upper_bounds - lower_bounds)).long()
+                clean_latents = sample["next_latents"][:, -1]
 
-                train_totalindex = torch.repeat_interleave(t_indices, repeats=config.train.batch_size) # [12]
-                timesteps = sample["timesteps"][0][train_totalindex].view(-1,1,1,1) / 1000 # [12, 1, 1, 1]
-            else:
-                raise NotImplementedError("Only logit_normal, uniform, and discrete are supported with time_type")
-
-            clean_latents = sample["next_latents"][:, -1]
-            
-            # repeat embeds and pooled_embeds for batched sampling and training
-            embeds = torch.cat([embeds] * config.train.train_timesteps, dim = 0)
-            pooled_embeds = torch.cat([pooled_embeds] * config.train.train_timesteps, dim = 0)
-            clean_latents = torch.cat([clean_latents] * config.train.train_timesteps, dim = 0)
-            train_random_noise = torch.cat([randn_tensor(
-                                    sample["latents"][:, 0].shape,
-                                    generator=None,
-                                    device=accelerator.device,
-                                    dtype=sample["latents"][:, 0].dtype,
-                                ) for _ in range(config.train.train_timesteps)], dim = 0)
+                # repeat embeds and pooled_embeds for batched sampling and training
+                embeds = torch.cat([embeds] * config.train.train_timesteps, dim = 0)
+                pooled_embeds = torch.cat([pooled_embeds] * config.train.train_timesteps, dim = 0)
+                clean_latents = torch.cat([clean_latents] * config.train.train_timesteps, dim = 0)
+                train_random_noise = torch.cat([randn_tensor(
+                                        sample["latents"][:, 0].shape,
+                                        generator=None,
+                                        device=accelerator.device,
+                                        dtype=sample["latents"][:, 0].dtype,
+                                    ) for _ in range(config.train.train_timesteps)], dim = 0)
 
 
-            sample['timesteps'] = timesteps # [12, 1, 1, 1]
-            sample['train_random_noise'] = train_random_noise # [12, 16, 64, 64]
-            sample['clean_latents'] = clean_latents # [12, 16, 64, 64]
-            # equivalent to i < config.sample.num_batches_per_epoch // ( config.sample.num_batches_per_epoch // config.train.gradient_accumulation_steps )
-            if not config.train.off_policy:
-                if i < config.train.gradient_accumulation_steps:
-                    continue
+                if share_prompt_noise:
+                    # Keep the legacy draws above: their RNG consumption fixes
+                    # subsequent rollout noise and shuffle streams. Only replace
+                    # the training inputs, using independent prompt generators.
+                    timesteps, train_random_noise = shared_prompt_training_inputs(
+                        sample["prompt_noise_seed"], sample["timesteps"],
+                        sample["latents"][:, 0],
+                        num_timesteps=config.train.train_timesteps,
+                        timestep_fraction=config.train.timestep_fraction,
+                        time_type=config.time_type,
+                    )
 
-            timesteps = sample["timesteps"]
-            noised_latents = (1-timesteps) * sample['clean_latents'] + timesteps * sample['train_random_noise']
-            if config.train.off_policy:
-                transformer.module.set_adapter('ema')
-            with autocast():
-                with torch.no_grad():
-                    log_prob, _, _ = compute_log_prob_awm(transformer, pipeline, sample, timesteps, embeds, pooled_embeds, config, noised_latents, sample['clean_latents'], sample['train_random_noise'], weighting=config.train.weighting)
-            sample['old_log_probs'] = log_prob.reshape(config.train.train_timesteps, config.train.batch_size)
-            if config.train.off_policy:
-                transformer.module.set_adapter('default')
+                sample['timesteps'] = timesteps # [12, 1, 1, 1]
+                sample['train_random_noise'] = train_random_noise # [12, 16, 64, 64]
+                sample['clean_latents'] = clean_latents # [12, 16, 64, 64]
+                # equivalent to i < config.sample.num_batches_per_epoch // ( config.sample.num_batches_per_epoch // config.train.gradient_accumulation_steps )
+                if not config.train.off_policy:
+                    if i < config.train.gradient_accumulation_steps:
+                        continue
+
+                timesteps = sample["timesteps"]
+                noised_latents = (1-timesteps) * sample['clean_latents'] + timesteps * sample['train_random_noise']
+                if config.train.off_policy:
+                    transformer.module.set_adapter('ema')
+                with autocast():
+                    with torch.no_grad():
+                        log_prob, _, _ = compute_log_prob_awm(transformer, pipeline, sample, timesteps, embeds, pooled_embeds, config, noised_latents, sample['clean_latents'], sample['train_random_noise'], weighting=config.train.weighting)
+                sample['old_log_probs'] = log_prob.reshape(config.train.train_timesteps, config.train.batch_size)
+                if config.train.off_policy:
+                    transformer.module.set_adapter('default')
 
         for i, sample in tqdm(
             list(enumerate(samples_batched)),
@@ -1262,7 +1442,7 @@ def main(_):
             embeds = torch.cat([embeds] * config.train.train_timesteps, dim = 0)
             pooled_embeds = torch.cat([pooled_embeds] * config.train.train_timesteps, dim = 0)
 
-            with accelerator.accumulate(transformer):
+            with (logical.use(sample["_logical_rank"]) if logical else contextlib.nullcontext()), accelerator.accumulate(transformer):
 
                 timesteps = sample["timesteps"]
                 noised_latents = (1-timesteps) * sample['clean_latents'] + timesteps * sample['train_random_noise']
@@ -1270,9 +1450,45 @@ def main(_):
                 with autocast():
                     log_prob, model_output, std_dev_t = compute_log_prob_awm(transformer, pipeline, sample, timesteps, embeds, pooled_embeds, config, noised_latents, sample['clean_latents'], sample['train_random_noise'], weighting=config.train.weighting)
                     if config.train.beta > 0:
+                        base_cond_embeds = torch.cat(
+                            [sample["prompt_embeds"]] * config.train.train_timesteps,
+                            dim=0,
+                        )
+                        base_cond_pooled_embeds = torch.cat(
+                            [sample["pooled_prompt_embeds"]] * config.train.train_timesteps,
+                            dim=0,
+                        )
+                        base_negative_embeds = None
+                        base_negative_pooled_embeds = None
+                        if config.train.base_kl_cfg_scale > 1.0:
+                            base_negative_embeds = torch.cat(
+                                [train_neg_prompt_embeds[:len(sample["prompt_embeds"])]]
+                                * config.train.train_timesteps,
+                                dim=0,
+                            )
+                            base_negative_pooled_embeds = torch.cat(
+                                [train_neg_pooled_prompt_embeds[:len(sample["pooled_prompt_embeds"])]]
+                                * config.train.train_timesteps,
+                                dim=0,
+                            )
                         with torch.no_grad():
                             with transformer.module.disable_adapter():
-                                log_prob_ref, model_output_ref, std_dev_t_ref = compute_log_prob_awm(transformer, pipeline, sample, timesteps, embeds, pooled_embeds, config, noised_latents, sample['clean_latents'], sample['train_random_noise'], weighting=config.train.weighting)
+                                log_prob_ref, model_output_ref, std_dev_t_ref = compute_log_prob_awm(
+                                    transformer,
+                                    pipeline,
+                                    sample,
+                                    timesteps,
+                                    base_cond_embeds,
+                                    base_cond_pooled_embeds,
+                                    config,
+                                    noised_latents,
+                                    sample['clean_latents'],
+                                    sample['train_random_noise'],
+                                    weighting=config.train.weighting,
+                                    cfg_scale_override=config.train.base_kl_cfg_scale,
+                                    negative_embeds=base_negative_embeds,
+                                    negative_pooled_embeds=base_negative_pooled_embeds,
+                                )
                     if config.train.ema_beta > 0:
                         transformer.module.set_adapter('ema')
                         with torch.no_grad():
@@ -1389,7 +1605,10 @@ def main(_):
                 global_step += 1
                 info = defaultdict(list)
         if config.train.ema:
-            ema.step(transformer_trainable_parameters, global_step)
+            if logical:
+                logical.update_ema(transformer_trainable_parameters, global_step)
+            else:
+                ema.step(transformer_trainable_parameters, global_step)
         # make sure we did an optimization step at the end of the inner epoch
         training_end_time = time.time()
         training_time = training_end_time - training_start_time
@@ -1403,14 +1622,16 @@ def main(_):
                 "training_time": training_time,
                 "epoch_time": epoch_time,
             },
-            step=global_step,
+            # Loss/reward use the pre-increment update index, as in old runs.
+            # Attach completed-epoch timing to its last update, not the next one.
+            step=global_step - 1,
         )
 
         with torch.no_grad():
             if config.train.kl_ema_decay_type == 'constant':
                 decay = config.train.kl_ema_decay
             elif config.train.kl_ema_decay_type == 'linear':
-                decay = min(config.train.kl_ema_decay, 0.001 * global_step)
+                decay = min(config.train.kl_ema_decay, config.train.kl_ema_decay_rate * global_step)
             if accelerator.is_main_process:
                 print(f'current_step:{global_step}, decay:{decay}')
             for src_param, tgt_param in zip(
@@ -1418,7 +1639,23 @@ def main(_):
             ):
                 tgt_param.data.copy_(tgt_param.detach().data * decay + src_param.detach().clone().data * (1.0 - decay))
 
+        if accelerator.is_main_process:
+            wandb_logger.flush()
+
+        if logical and (global_step % config.checkpoint_every_steps == 0 or epoch == config.num_epochs - 1):
+            metadata = {
+                "global_step": global_step, "next_epoch": epoch + 1,
+                "next_rollout_cursor": (epoch + 1) * layout.rounds,
+                "world_size": accelerator.num_processes,
+                "save_dir": config.save_dir, "run_name": config.run_name,
+                "wandb_run_id": config.wandb_run_id, "signature": run_signature,
+                "history_prompts": sorted(stat_tracker.history_prompts) if config.per_prompt_stat_tracking else [],
+            }
+            destination = save_checkpoint(config.save_dir, unwrap_model(transformer, accelerator),
+                                          optimizer, lr_scheduler, accelerator, logical, metadata)
+            logger.info(f"Saved complete epoch-boundary checkpoint: {destination}")
+
+
 
 if __name__ == "__main__":
     app.run(main)
-

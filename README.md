@@ -18,18 +18,25 @@ Efficient reinforcement learning for text-to-image diffusion models. This implem
 ### Environment Setup
 
 ```bash
-# Automated environment setup.
-# The script `setup/02_setup_env_reward_server.sh` installs MMCV and MMDetection.
-# For GPUs with Ampere architecture (e.g., A100, RTX 30xx),
-# please follow the comments in the script to adjust the MMCV/MMDetection installation accordingly.
+# Main training and Geneval reward environments are separate.
+# A CUDA compiler is required for MMCV; default target is H100.
+# For A100: export TORCH_CUDA_ARCH_LIST=8.0
 bash setup_env.sh
 ```
+
+See [installation, dependencies and portable paths](setup/README.md) before
+installing. The scripts preserve existing environments unless
+`AWM_UPDATE_ENV=1` is explicitly set. OCR requires the optional
+`AWM_INSTALL_OCR=1` setup flag.
 
 ### Environment Variables
 
 ```bash
 export HUGGINGFACE_TOKEN="your_hf_token"
 export WANDB_API_KEY="your_wandb_key"
+# Optional; defaults are checkout-relative and independent of the launch directory.
+export AWM_OUTPUT_DIR="/your/storage/awm"
+export AWM_DATA_DIR="/your/datasets"  # contains geneval/, ocr/, pickscore/
 ```
 
 ### Training
@@ -68,11 +75,32 @@ Configurations in [advantage_weighted_matching/config/dgx_awm.py](advantage_weig
 
 #### SD3.5 Configs
 - `geneval_sd3_no_cfg_1node` - GenEval
+- `geneval_sd3_no_cfg_2nodes` - GenEval
 - `geneval_sd3_no_cfg_4nodes` - GenEval
 - `ocr_sd3_no_cfg_1node` - OCR
 - `ocr_sd3_no_cfg_4nodes` - OCR
 - `pickscore_sd3_no_cfg_1node` - PickScore
 - `pickscore_sd3_no_cfg_4nodes` - PickScore
+
+The current task configs share `ghuber_power=0.5`,
+`time_type="discrete_with_init"`, `base_kl_cfg_scale=4.5`,
+`share_prompt_training_noise=True`, and `logical_ranks=32`.
+Rollout/evaluation guidance remains 1.0; base-KL CFG applies only to the frozen
+base reference. Training noise is shared within each prompt/epoch, not rollout
+noise. Task-specific settings remain different:
+
+| Task | Base KL beta | Images/epoch | Train batch/GPU | Logical rollout rounds | Eval interval |
+| --- | --- | --- | --- | --- | --- |
+| GenEval | 0.003 | 1728 | 3 | 9 | 50 epochs |
+| OCR | 0.003 | 1728 | 3 | 9 | 20 epochs |
+| PickScore | 0.0001 | 576 | 2 | 3 | 50 epochs |
+
+Each node config assumes eight GPUs. Physical rollout batches and accumulation
+scale with the number of logical ranks handled per GPU. Full checkpoints are
+saved every 10 updates at completed epoch boundaries. See
+[resume and input-layout documentation](advantage_weighted_matching/docs/resume.md)
+for recovery, compatibility limits and tests. These defaults supersede the
+original recipes.
 
 ### Key Parameters
 
@@ -110,6 +138,7 @@ config.train.learning_rate = 3e-4                                     # AdamW le
 
 # Advantage / KL control
 config.train.beta = 0.003                                             # KL regularization coefficient
+config.train.base_kl_cfg_scale = 4.5                                  # Base reference only; PickScore beta remains 0.0001
 config.train.clip_range = 1                                           # Advantage clipping epsilon; currently not work (on policy)
 config.train.advantage_max = 1                                        # Max advantage abs value
 config.train.kl_weight = "Uniform"                                    # Time weighting for KL term; Uniform or ELBO
@@ -117,13 +146,14 @@ config.train.kl_weight = "Uniform"                                    # Time wei
 # Loss shaping
 config.train.loss_type = "exp_first"                                  # Loss formulation; exp_first or sum_first; gradient is equivalent for on-policy
 config.train.weighting = "ghuber"                                     # Robust loss weighting scheme
-config.train.ghuber_power = 0.25                                      # Power for generalized Huber weighting
+config.train.ghuber_power = 0.5                                       # Power for generalized Huber weighting
 config.train.timestep_fraction = 0.9                                  # Fraction of timesteps used for loss
 
 # KL-EMA (mimic TRPO)
 config.train.kl_ema_weight = "Uniform"                                # Time weighting for KL-EMA
 config.train.kl_ema_decay = 0.3                                       # EMA decay rate
 config.train.kl_ema_decay_type = "linear"                             # EMA decay schedule
+config.train.kl_ema_decay_rate = 0.001                                # min(rate * global_step, kl_ema_decay)
 config.train.ema_beta = 1                                             # Scaling factor for EMA KL
 
 # EMA & optimization tricks
@@ -132,7 +162,8 @@ config.train.ema_decay = 0.99                                         # EMA deca
 config.train.ema_update_step_interval = 1                             # EMA update frequency
 
 # Time sampling
-config.time_type = "discrete_wo_init"                                 # Time sampling strategy
+config.time_type = "discrete_with_init"                               # Initial schedule index plus 5 stratified indices
+config.train.share_prompt_training_noise = True                      # Shared per prompt/epoch, independent of physical rank
 
 # Rewards
 config.reward_fn = {                                                   # Reward function(s) and weights
@@ -142,7 +173,9 @@ config.reward_fn = {                                                   # Reward 
 # Logging & bookkeeping
 config.per_prompt_stat_tracking = True                                # Track per-prompt statistics
 config.num_epochs = 100000                                            # Total training epochs
-config.save_freq = 20–50                                              # Checkpoint saving frequency (epochs)
+config.checkpoint_every_steps = 10                                    # Full epoch-boundary checkpoints
+config.logical_ranks = 32                                            # Fixed input/RNG layout
+config.logical_rounds = 9                                            # Geneval/OCR: 9; PickScore: 3
 config.eval_freq = 20–50                                              # Evaluation frequency (epochs)
 ```
 

@@ -1,63 +1,48 @@
-#!/bin/bash
-
-# Source the common variables and functions
+#!/usr/bin/env bash
+set -euo pipefail
 source "$(dirname "$0")/common_vars.sh"
 source_conda
 
-ENV_NAME="reward_server"
-log "Step 2: Setting up Conda environment: ${ENV_NAME}"
-
-# Check if environment already exists
-if conda info --envs | grep -q "^${ENV_NAME}\s"; then
-  log "Conda environment '${ENV_NAME}' already exists. Skipping creation."
+if env_exists "$AWM_REWARD_ENV_NAME"; then
+  if [[ "${AWM_UPDATE_ENV:-0}" != 1 ]]; then
+    log "Environment $AWM_REWARD_ENV_NAME exists; leaving it unchanged. Set AWM_UPDATE_ENV=1 to update."
+    exit 0
+  fi
 else
-  log "Creating Conda environment '${ENV_NAME}' with Python ${PYTHON_VERSION}..."
-  conda create -n "$ENV_NAME" python="$PYTHON_VERSION" --yes
-
-  log "Activating environment and installing packages for '${ENV_NAME}'..."
-  conda activate "$ENV_NAME"
-  log "Downgrading pip to a version compatible with editable installs..."
-  conda install -y "pip<25"
-
-  # Navigate to the project directory
-  REWARD_SERVER_DIR="${PROJECT_ROOT}/reward-server"
-  cd "$REWARD_SERVER_DIR"
-
-  log "Installing PyTorch and other dependencies..."
-  pip install torch==2.1.2+cu121 torchvision==0.16.2+cu121 torchaudio==2.1.2+cu121 --index-url https://download.pytorch.org/whl/cu121
-
-  pip install transformers==4.38.2 gunicorn==23.0.0 openmim==0.3.9 open-clip-torch==2.31.0 numpy==1.26.0 opencv-python==4.11.0.86 clip-benchmark==1.6.1 flask==3.1.0
-
-  log "Installing MMCV and MMDetection..."
-  # For Ampere arch, derictly use 'mim install mmcv-full mmengine'
-  # For Hopper arch, install mmcv with the following command
-  git clone -b v1.7.2 --depth=1 https://github.com/open-mmlab/mmcv.git
-  cd mmcv
-  MMCV_WITH_OPS=1 MMCV_CUDA_ARGS="-arch=sm_90" pip install -v -e .
-  cd ..
-
-  if [ ! -d "mmdetection" ]; then
-    git clone https://github.com/open-mmlab/mmdetection.git
-  fi
-  cd mmdetection
-  git checkout 2.x
-
-  # Modify max version in init to avoid version conflicts
-  log "Patching mmdetection version requirement..."
-  sed -i "s/mmcv_maximum_version = '.*'/mmcv_maximum_version = '2.3.0'/" mmdet/__init__.py
-  # For Ampere arch, derictly use 'pip install -e .'
-  # For Hopper arch, install mmdetection with the following command
-  MMCV_CUDA_ARGS="-arch=sm_90" pip install --no-build-isolation -v -e .
-  cd "$REWARD_SERVER_DIR"
-
-  log "Downloading Mask2Former model weights..."
-  MODEL_FILE="mask2former_swin-s-p4-w7-224_lsj_8x2_50e_coco.pth"
-  if [ ! -f "$MODEL_FILE" ]; then
-    wget -O "$MODEL_FILE" https://download.openmmlab.com/mmdetection/v2.0/mask2former/mask2former_swin-s-p4-w7-224_lsj_8x2_50e_coco/mask2former_swin-s-p4-w7-224_lsj_8x2_50e_coco_20220504_001756-743b7d99.pth
-  else
-    log "Model weights already downloaded."
-  fi
-
-  conda deactivate
-  log "Environment '${ENV_NAME}' setup complete."
+  conda create -n "$AWM_REWARD_ENV_NAME" python="$PYTHON_VERSION" --yes
 fi
+conda activate "$AWM_REWARD_ENV_NAME"
+# Do not inherit main-environment constraints into the older detector stack.
+export PIP_CONSTRAINT="$PROJECT_ROOT/reward-server/requirements-geneval.txt"
+python -m pip install pip==24.3.1 setuptools==60.2.0 wheel
+python -m pip install torch==2.1.2+cu121 torchvision==0.16.2+cu121 torchaudio==2.1.2+cu121 \
+  --index-url https://download.pytorch.org/whl/cu121
+python -m pip install -r "$PIP_CONSTRAINT"
+
+mkdir -p "$PROJECT_ROOT/third_party"
+ensure_checkout https://github.com/open-mmlab/mmcv.git v1.7.2 \
+  4c01b026f0afa5a91a5f54aea313788da1e40f95 "$PROJECT_ROOT/third_party/mmcv"
+ensure_checkout https://github.com/open-mmlab/mmdetection.git v2.28.2 \
+  e9cae2d0787cd5c2fc6165a6061f92fa09e48fb1 "$PROJECT_ROOT/third_party/mmdetection"
+
+# Defaults to H100. For A100 set TORCH_CUDA_ARCH_LIST=8.0; other GPUs need
+# the appropriate architecture and a toolkit compatible with Torch cu121.
+export TORCH_CUDA_ARCH_LIST="${TORCH_CUDA_ARCH_LIST:-9.0}"
+if ! command -v nvcc >/dev/null 2>&1 && [[ ! -x "${CUDA_HOME:-/nonexistent}/bin/nvcc" ]]; then
+  log "MMCV needs a CUDA toolkit/compiler. Set CUDA_HOME and PATH before installation."
+  exit 1
+fi
+MMCV_WITH_OPS=1 python -m pip install --no-build-isolation -v -e "$PROJECT_ROOT/third_party/mmcv"
+python -m pip install --no-build-isolation -v -e "$PROJECT_ROOT/third_party/mmdetection"
+# v1.7.2 satisfies v2.28.2's original MMCV check; no source patch is needed.
+
+REWARD_SERVER_DIR="$PROJECT_ROOT/reward-server"
+MODEL_FILE="$REWARD_SERVER_DIR/mask2former_swin-s-p4-w7-224_lsj_8x2_50e_coco.pth"
+if [[ ! -f "$MODEL_FILE" ]]; then
+  download="$(mktemp "$REWARD_SERVER_DIR/.mask2former-download.XXXXXX")"
+  wget -O "$download" https://download.openmmlab.com/mmdetection/v2.0/mask2former/mask2former_swin-s-p4-w7-224_lsj_8x2_50e_coco/mask2former_swin-s-p4-w7-224_lsj_8x2_50e_coco_20220504_001756-743b7d99.pth
+  mv -- "$download" "$MODEL_FILE"
+fi
+python -m pip check
+conda deactivate
+log "Geneval reward environment setup finished."

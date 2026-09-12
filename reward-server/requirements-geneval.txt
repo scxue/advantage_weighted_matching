@@ -1,0 +1,17 @@
+# Geneval service only; separate environment from AWM training.
+# Install the matching cu121 Torch wheels first (see setup script).
+torch==2.1.2
+torchvision==0.16.2
+torchaudio==2.1.2
+transformers==4.38.2
+tokenizers==0.15.2
+huggingface-hub==0.36.2
+gunicorn==23.0.0
+openmim==0.3.9
+open-clip-torch==2.31.0
+numpy==1.26.0
+opencv-python==4.11.0.86
+clip-benchmark==1.6.1
+flask==3.1.0
+pandas==2.2.3
+# MMCV/MMDetection are installed from fixed source commits by the setup script.

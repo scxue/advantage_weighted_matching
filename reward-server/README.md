@@ -2,57 +2,53 @@
 
 Serves reward inference using an HTTP server.
 
-## Install
+## Geneval installation
 
-### GenEval
-
-```bash
-# First
-conda create -n reward_server python=3.10.16
-# Then
-pip install torch==2.1.2+cu121 torchvision==0.16.2+cu121 torchaudio==2.1.2+cu121 --index-url https://download.pytorch.org/whl/cu121
-# Then
-pip install -r requirements.txt
-```
-
-Then install mmdet:
+Use a separate environment from AWM training:
 
 ```bash
-mim install mmcv-full mmengine
-git clone https://github.com/open-mmlab/mmdetection.git
-cd mmdetection; git checkout 2.x
-# Modify mmdet/__init__.py: set mmcv_maximum_version = '2.3.0'
-pip install -e .
+# From the repository root; see setup/README.md for Conda/CUDA configuration.
+bash setup/02_setup_env_reward_server.sh
 ```
 
-Then download mask2former:
+The script uses `requirements-geneval.txt`, Torch 2.1.2+cu121, MMCV v1.7.2,
+and MMDetection v2.28.2. The two detector repositories are checked out at fixed
+commits under `third_party/`; existing mismatched/modified checkouts are not
+overwritten. They are local dependencies, not submodules tracked by the parent
+repository. No version-check patch is needed.
+
+MMCV compilation needs a compatible CUDA toolkit. H100 is the default target
+(`TORCH_CUDA_ARCH_LIST=9.0`); use `8.0` for A100.
+Existing environments are skipped unless `AWM_UPDATE_ENV=1` is explicitly set.
+The older `requirements.txt` is a legacy broad export, not this installation path.
+
+Defaults locate the detector config under `third_party/mmdetection/configs/`
+and its downloaded checkpoint in `reward-server/`. Override without editing code:
 
 ```bash
-wget https://download.openmmlab.com/mmdetection/v2.0/mask2former/mask2former_swin-s-p4-w7-224_lsj_8x2_50e_coco/mask2former_swin-s-p4-w7-224_lsj_8x2_50e_coco_20220504_001756-743b7d99.pth -O "$1/mask2former_swin-s-p4-w7-224_lsj_8x2_50e_coco.pth"
+export GENEVAL_CONFIG_PATH=/path/to/mask2former_config.py
+export GENEVAL_CKPT_PATH=/directory/containing/detector/weights
 ```
-
-Modify `MY_CONFIG_PATH` and `MY_CKPT_PATH` in `reward-server/reward_server/gen_eval.py` to your own paths.
 
 ## Usage
 
-### GenEval
-
-Start the server side:
+### Geneval
 
 ```bash
-cd reward-server/
-conda deactivate
-conda activate reward_server
-gunicorn "app_geneval:create_app()"
+conda activate "${AWM_REWARD_ENV_NAME:-reward_server}"
+cd reward-server
+GENEVAL_NUM_DEVICES=8 gunicorn --config gunicorn.conf.py "app_geneval:create_app()"
 ```
 
-You must modify `gunicorn.conf.py` to change the number of GPUs.
-
-After starting, you can run the client for testing:
+After the workers have loaded their models:
 
 ```bash
 python test/test_geneval.py
 ```
+
+The detector checkpoint filename is
+`mask2former_swin-s-p4-w7-224_lsj_8x2_50e_coco.pth`. The setup script downloads
+it only when absent, using a temporary file before publishing the final name.
 
 ### DeQA
 If there's an error, please refer to [DeQA](https://github.com/zhiyuanyou/DeQA-Score ) to install DeQA's dependencies.
