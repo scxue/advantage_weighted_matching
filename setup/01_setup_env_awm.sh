@@ -30,5 +30,7 @@ if [[ "${AWM_INSTALL_IMAGEREWARD:-0}" == 1 ]]; then
   python -m pip install image-reward timm==1.0.13
 fi
 python -m pip check
+# pip check cannot detect incompatible Python APIs between these packages.
+python -c "import albumentations"
 conda deactivate
 log "Main environment setup finished."

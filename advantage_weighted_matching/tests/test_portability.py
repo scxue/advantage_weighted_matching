@@ -1,5 +1,7 @@
 """Portable config paths, dependency declarations and non-destructive setup helpers."""
 import os
+import contextlib
+import io
 from pathlib import Path
 import subprocess
 import sys
@@ -52,14 +54,96 @@ class PortabilityTests(unittest.TestCase):
         required = received["install_requires"]
         for pin in ("torch==2.6.0", "torchvision==0.21.0", "torchaudio==2.6.0",
                     "accelerate==1.9.0", "transformers==4.54.0", "tokenizers==0.21.4",
-                    "huggingface-hub==0.36.2", "wandb==0.29.0", "xformers==0.0.29.post3"):
+                    "huggingface-hub==0.36.2", "wandb==0.29.0", "xformers==0.0.29.post3",
+                    "albumentations==1.4.10", "albucore==0.0.13"):
             self.assertIn(pin, required)
         main = (ROOT / "setup/01_setup_env_awm.sh").read_text()
         self.assertIn('export PIP_CONSTRAINT="$PROJECT_ROOT/advantage_weighted_matching/requirements.txt"', main)
         self.assertNotIn("pip install accelerate", main)
+        self.assertIn('python -c "import albumentations"', main)
         reward = (ROOT / "reward-server/requirements-geneval.txt").read_text()
         self.assertIn("torch==2.1.2", reward)
         self.assertIn("transformers==4.38.2", reward)
+        self.assertIn("ninja==1.13.2", reward)
+
+    def test_cuda_build_layouts_and_fail_fast(self):
+        script = (ROOT / "setup/02_setup_env_reward_server.sh").read_text()
+        helper = "configure_cuda_build() {" + script.split("configure_cuda_build() {", 1)[1].split("\n}\n", 1)[0] + "\n}\n"
+        for layout in ("standard", "conda", "symlink", "auto", "invalid", "missing_crt", "bad_jobs", "bad_header", "no_ninja"):
+            with self.subTest(layout=layout), tempfile.TemporaryDirectory() as temp:
+                root = Path(temp) / "toolkit with spaces"
+                runtime = root / ("include" if layout == "standard" else "targets/x86_64-linux/include")
+                crt = root / "include/crt"
+                runtime.mkdir(parents=True)
+                crt.mkdir(parents=True, exist_ok=True)
+                (runtime / "cuda_runtime_api.h").write_text('#include <crt/host_defines.h>\n')
+                if layout != "missing_crt":
+                    (crt / "host_defines.h").write_text("#error invalid header\n" if layout == "bad_header" else "#pragma once\n")
+                library = root / "targets/x86_64-linux/lib"
+                library.mkdir(parents=True)
+                binaries = root / "bin"
+                binaries.mkdir()
+                for name, output in (("nvcc", "Cuda compilation tools, release 12.1"), ("ninja", "1.13.2")):
+                    executable = binaries / name
+                    executable.write_text("#!/bin/sh\n" + ("exit 1\n" if layout == "no_ninja" and name == "ninja" else f"echo '{output}'\n"))
+                    executable.chmod(0o755)
+                home = root
+                if layout == "symlink":
+                    home = Path(temp) / "cuda-shim"
+                    home.mkdir()
+                    (home / "bin").symlink_to(binaries, target_is_directory=True)
+                    (home / "include").symlink_to(runtime, target_is_directory=True)
+                env = dict(os.environ)
+                env.update(CUDA_HOME=str(home), PATH=f"{binaries}:/usr/bin:/bin",
+                           CPATH="/existing/includes", LIBRARY_PATH="/existing/libs",
+                           LD_LIBRARY_PATH="/unchanged/runtime", CPLUS_INCLUDE_PATH="/unchanged/cxx",
+                           CXX="/usr/bin/c++")
+                env.pop("MAX_JOBS", None)
+                if layout == "auto":
+                    env.pop("CUDA_HOME")
+                if layout == "invalid":
+                    env["CUDA_HOME"] = str(Path(temp) / "missing")
+                if layout == "conda":
+                    env["MAX_JOBS"] = "24"
+                if layout == "bad_jobs":
+                    env["MAX_JOBS"] = "0"
+                command = ('set -euo pipefail; log() { echo "$*"; }; ' + helper +
+                           'configure_cuda_build; printf "RESULT=%s\\n" "$CUDA_HOME" "$CPATH" '
+                           '"$LIBRARY_PATH" "$LD_LIBRARY_PATH" "$CPLUS_INCLUDE_PATH" "$MAX_JOBS"')
+                result = subprocess.run(["bash", "-c", command], env=env, text=True, capture_output=True)
+                if layout in ("invalid", "missing_crt", "bad_jobs", "bad_header", "no_ninja"):
+                    self.assertNotEqual(result.returncode, 0, result.stdout)
+                    self.assertNotIn("RESULT=", result.stdout)
+                else:
+                    self.assertEqual(result.returncode, 0, result.stderr + result.stdout)
+                    values = [line.removeprefix("RESULT=") for line in result.stdout.splitlines() if line.startswith("RESULT=")]
+                    self.assertEqual(values[0], str(home))
+                    self.assertIn(str(root / "include"), values[1].split(":"))
+                    self.assertTrue(values[1].endswith("/existing/includes"))
+                    self.assertIn(str(library), values[2].split(":"))
+                    self.assertTrue(values[2].endswith("/existing/libs"))
+                    self.assertEqual(values[3:5], ["/unchanged/runtime", "/unchanged/cxx"])
+                    if layout == "conda":
+                        self.assertEqual(values[5], "24")
+                    else:
+                        self.assertTrue(1 <= int(values[5]) <= 16)
+
+    def test_cuda_version_check(self):
+        script = (ROOT / "setup/02_setup_env_reward_server.sh").read_text()
+        check = script.split("python - <<'PY'\n", 1)[1].split("\nPY\n", 1)[0]
+        for runtime, compiler, fails in (("12.1", "12.1", False), ("12.1", "12.4", False),
+                                         ("12.1", "11.8", True), (None, "12.1", True),
+                                         ("12.1", "unknown", True)):
+            with self.subTest(runtime=runtime, compiler=compiler), patch.dict(os.environ, CUDA_HOME="/selected/cuda"), \
+                 patch.dict(sys.modules, {"torch": types.SimpleNamespace(version=types.SimpleNamespace(cuda=runtime))}), \
+                 patch("subprocess.check_output", return_value=f"release {compiler}"), \
+                 contextlib.redirect_stdout(io.StringIO()) as output:
+                if fails:
+                    with self.assertRaises(SystemExit):
+                        exec(check, {})
+                else:
+                    exec(check, {})
+                    self.assertEqual("Warning:" in output.getvalue(), runtime != compiler)
 
     def shell(self, code, directory, **overrides):
         env = dict(os.environ)

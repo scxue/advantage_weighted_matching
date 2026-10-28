@@ -11,6 +11,7 @@ scipy==1.15.2
 scikit-learn==1.6.1
 scikit-image==0.25.2
 albumentations==1.4.10
+albucore==0.0.13
 opencv-python==4.11.0.86
 pillow==10.4.0
 tqdm==4.67.1
